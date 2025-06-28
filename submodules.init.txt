@@ -4,3 +4,4 @@ git submodule add --force -b "master" https://github.com/aiekick/EzLibs.git 3rdp
 git submodule add --force -b "master" https://github.com/aiekick/BuildInc.git 3rdparty/buildinc
 git submodule add --force -b "master" https://github.com/ocornut/imgui.git 3rdparty/imgui
 git submodule add --force -b "main" https://github.com/ocornut/imgui_test_engine.git 3rdparty/imgui_test_engine
+git submodule add --force -b "master" https://github.com/aiekick/EzLibs.git 3rdparty/ezlibs
