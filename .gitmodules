@@ -1,0 +1,28 @@
+[submodule "ImCode"]
+	path = ImCode
+	url = https://github.com/aiekick/ImCode.git
+	branch = master
+[submodule "3rdparty/glfw"]
+	path = 3rdparty/glfw
+	url = https://github.com/glfw/glfw.git
+	branch = master
+[submodule "3rdparty/glad"]
+	path = 3rdparty/glad
+	url = https://github.com/Dav1dde/glad.git
+	branch = c
+[submodule "3rdparty/ezlibs"]
+	path = 3rdparty/ezlibs
+	url = https://github.com/aiekick/EzLibs.git
+	branch = master
+[submodule "3rdparty/buildinc"]
+	path = 3rdparty/buildinc
+	url = https://github.com/aiekick/BuildInc.git
+	branch = master
+[submodule "3rdparty/imgui"]
+	path = 3rdparty/imgui
+	url = https://github.com/ocornut/imgui.git
+	branch = master
+[submodule "3rdparty/imgui_test_engine"]
+	path = 3rdparty/imgui_test_engine
+	url = https://github.com/ocornut/imgui_test_engine.git
+	branch = main
