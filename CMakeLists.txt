@@ -5,6 +5,8 @@ set(PROJECT TestApp)
 project(${PROJECT} CXX)
 enable_language(C CXX)
 
+option(USE_IM_CODE_TESTING "Enable ImCode testing" OFF)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -117,6 +119,8 @@ add_custom_command(
 ##### TESTS ############################################
 ########################################################
 
-if(USE_BUILDING_OF_TESTS)
+if(USE_IM_CODE_TESTING)
 	enable_testing()
+	include(cmake/googletest.cmake)
+	add_subdirectory(tests)
 endif()
