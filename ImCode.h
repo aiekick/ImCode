@@ -168,6 +168,7 @@ public:
 
     // ---- content (no file IO inside Code) ----
     void        setText(const char* aData, uint64_t aLen);  // buffer mode
+    void        insertText(const char* aText);              // insert at caret (replaces selection)
     void        setSource(DataSource* apSource);            // pull mode (host owns the bytes)
     std::string getText() const;                            // small-file convenience
     void        enumerateSpans(const std::function<void(const char* aData, uint64_t aLen)>& aVisitor) const;  // save walk

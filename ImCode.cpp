@@ -578,6 +578,12 @@ void Code::setText(const char* aData, uint64_t aLen) {
     mp_impl->relex();
 }
 
+void Code::insertText(const char* aText) {
+    if (aText == nullptr) return;
+    if ((mp_impl->m_config.flags & Flags_ReadOnly) != 0) return;
+    mp_impl->typeText(aText, Impl::EditKind::Other);
+}
+
 std::string Code::getText() const {
     std::string out;
     const auto& lines = mp_impl->m_lines;
