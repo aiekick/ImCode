@@ -44,124 +44,150 @@ struct LexToken {
     int32_t color{};
 };
 
-inline bool isLetter(char aChar) { return (aChar >= 'a' && aChar <= 'z') || (aChar >= 'A' && aChar <= 'Z') || aChar == '_'; }
-inline bool isDigit(char aChar)  { return aChar >= '0' && aChar <= '9'; }
-inline bool isAlnum(char aChar)  { return isLetter(aChar) || isDigit(aChar); }
-inline bool isOpChar(char aChar) { return aChar != 0 && std::strchr("+-*/%=<>!&|^~?:.", aChar) != nullptr; }
-inline bool isPunct(char aChar)  { return aChar != 0 && std::strchr("(){}[];,", aChar) != nullptr; }
+// Per-line carry state between consecutive lines (small, trivially copyable).
+struct LexState {
+    bool inBlockComment{};
+};
 
-int32_t classifyCppWord(const std::string& aWord) {
-    static const std::unordered_set<std::string> keywords = {
-        "alignas", "alignof", "asm", "break", "case", "catch", "class", "concept", "const", "consteval", "constexpr",
-        "constinit", "const_cast", "continue", "decltype", "default", "delete", "do", "dynamic_cast", "else", "enum",
-        "explicit", "export", "extern", "false", "for", "friend", "goto", "if", "inline", "mutable", "namespace", "new",
-        "noexcept", "nullptr", "operator", "private", "protected", "public", "register", "reinterpret_cast", "requires",
-        "return", "sizeof", "static", "static_assert", "static_cast", "struct", "switch", "template", "this", "thread_local",
-        "throw", "true", "try", "typedef", "typeid", "typename", "union", "using", "virtual", "volatile", "while"};
-    static const std::unordered_set<std::string> types = {
-        "auto", "bool", "char", "char8_t", "char16_t", "char32_t", "double", "float", "int", "long", "short", "signed",
-        "unsigned", "void", "wchar_t", "size_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
-        "uint32_t", "uint64_t"};
-    if (keywords.count(aWord) != 0) return Code::Col_Keyword;
-    if (types.count(aWord) != 0) return Code::Col_Type;
-    return Code::Col_Identifier;
-}
+// Abstract lexer interface — one concrete implementation per language.
+// File-local for v1; can be promoted to the public header so hosts register
+// custom lexers, alongside the data-driven LanguageDef.
+class Lexer {
+public:
+    virtual ~Lexer() = default;
+    virtual void lexLine(const std::string& aLine, const LexState& aInState, std::vector<LexToken>& aoTokens, LexState& aoOutState) const = 0;
+};
 
-void lexCppLine(const std::string& aLine, bool aInBlock, std::vector<LexToken>& aoTokens, bool& aoInBlock) {
-    aoTokens.clear();
-    const int32_t n = (int32_t)aLine.size();
-    int32_t i = 0;
-    bool block = aInBlock;
-    while (i < n) {
-        if (block) {
-            const int32_t start = i;
-            while (i < n) {
-                if (aLine[(size_t)i] == '*' && i + 1 < n && aLine[(size_t)(i + 1)] == '/') { i += 2; block = false; break; }
-                ++i;
-            }
-            aoTokens.push_back({start, i - start, Code::Col_Comment});
-            continue;
-        }
-        const char c = aLine[(size_t)i];
-        if (c == ' ' || c == '\t') { ++i; continue; }
-        if (c == '/' && i + 1 < n && aLine[(size_t)(i + 1)] == '/') {
-            aoTokens.push_back({i, n - i, Code::Col_Comment});
-            i = n;
-            continue;
-        }
-        if (c == '/' && i + 1 < n && aLine[(size_t)(i + 1)] == '*') {
-            const int32_t start = i;
-            i += 2;
-            block = true;
-            while (i < n) {
-                if (aLine[(size_t)i] == '*' && i + 1 < n && aLine[(size_t)(i + 1)] == '/') { i += 2; block = false; break; }
-                ++i;
-            }
-            aoTokens.push_back({start, i - start, Code::Col_Comment});
-            continue;
-        }
-        if (c == '#') {
-            aoTokens.push_back({i, n - i, Code::Col_Preproc});
-            i = n;
-            continue;
-        }
-        if (c == '"') {
-            const int32_t start = i;
-            ++i;
-            while (i < n) {
-                if (aLine[(size_t)i] == '\\' && i + 1 < n) { i += 2; continue; }
-                if (aLine[(size_t)i] == '"') { ++i; break; }
-                ++i;
-            }
-            aoTokens.push_back({start, i - start, Code::Col_String});
-            continue;
-        }
-        if (c == '\'') {
-            const int32_t start = i;
-            ++i;
-            while (i < n) {
-                if (aLine[(size_t)i] == '\\' && i + 1 < n) { i += 2; continue; }
-                if (aLine[(size_t)i] == '\'') { ++i; break; }
-                ++i;
-            }
-            aoTokens.push_back({start, i - start, Code::Col_Char});
-            continue;
-        }
-        if (isDigit(c) || (c == '.' && i + 1 < n && isDigit(aLine[(size_t)(i + 1)]))) {
-            const int32_t start = i;
-            while (i < n) {
-                const char d = aLine[(size_t)i];
-                if (isAlnum(d) || d == '.' || d == '\'') {
+// C / C++ / GLSL (close enough for v1).
+class CppLexer final : public Lexer {
+public:
+    void lexLine(const std::string& aLine, const LexState& aInState, std::vector<LexToken>& aoTokens, LexState& aoOutState) const override {
+        aoTokens.clear();
+        const int32_t n = (int32_t)aLine.size();
+        int32_t i = 0;
+        bool block = aInState.inBlockComment;
+        while (i < n) {
+            if (block) {
+                const int32_t start = i;
+                while (i < n) {
+                    if (aLine[(size_t)i] == '*' && i + 1 < n && aLine[(size_t)(i + 1)] == '/') { i += 2; block = false; break; }
                     ++i;
-                } else if ((d == '+' || d == '-') && i > start && (aLine[(size_t)(i - 1)] == 'e' || aLine[(size_t)(i - 1)] == 'E')) {
-                    ++i;
-                } else {
-                    break;
                 }
+                aoTokens.push_back({start, i - start, Code::Col_Comment});
+                continue;
             }
-            aoTokens.push_back({start, i - start, Code::Col_Number});
-            continue;
+            const char c = aLine[(size_t)i];
+            if (c == ' ' || c == '\t') { ++i; continue; }
+            if (c == '/' && i + 1 < n && aLine[(size_t)(i + 1)] == '/') {
+                aoTokens.push_back({i, n - i, Code::Col_Comment});
+                i = n;
+                continue;
+            }
+            if (c == '/' && i + 1 < n && aLine[(size_t)(i + 1)] == '*') {
+                const int32_t start = i;
+                i += 2;
+                block = true;
+                while (i < n) {
+                    if (aLine[(size_t)i] == '*' && i + 1 < n && aLine[(size_t)(i + 1)] == '/') { i += 2; block = false; break; }
+                    ++i;
+                }
+                aoTokens.push_back({start, i - start, Code::Col_Comment});
+                continue;
+            }
+            if (c == '#') {
+                aoTokens.push_back({i, n - i, Code::Col_Preproc});
+                i = n;
+                continue;
+            }
+            if (c == '"') {
+                const int32_t start = i;
+                ++i;
+                while (i < n) {
+                    if (aLine[(size_t)i] == '\\' && i + 1 < n) { i += 2; continue; }
+                    if (aLine[(size_t)i] == '"') { ++i; break; }
+                    ++i;
+                }
+                aoTokens.push_back({start, i - start, Code::Col_String});
+                continue;
+            }
+            if (c == '\'') {
+                const int32_t start = i;
+                ++i;
+                while (i < n) {
+                    if (aLine[(size_t)i] == '\\' && i + 1 < n) { i += 2; continue; }
+                    if (aLine[(size_t)i] == '\'') { ++i; break; }
+                    ++i;
+                }
+                aoTokens.push_back({start, i - start, Code::Col_Char});
+                continue;
+            }
+            if (isDigit(c) || (c == '.' && i + 1 < n && isDigit(aLine[(size_t)(i + 1)]))) {
+                const int32_t start = i;
+                while (i < n) {
+                    const char d = aLine[(size_t)i];
+                    if (isAlnum(d) || d == '.' || d == '\'') {
+                        ++i;
+                    } else if ((d == '+' || d == '-') && i > start && (aLine[(size_t)(i - 1)] == 'e' || aLine[(size_t)(i - 1)] == 'E')) {
+                        ++i;
+                    } else {
+                        break;
+                    }
+                }
+                aoTokens.push_back({start, i - start, Code::Col_Number});
+                continue;
+            }
+            if (isLetter(c)) {
+                const int32_t start = i;
+                while (i < n && isAlnum(aLine[(size_t)i])) ++i;
+                aoTokens.push_back({start, i - start, classifyWord(aLine.substr((size_t)start, (size_t)(i - start)))});
+                continue;
+            }
+            if (isOpChar(c)) {
+                const int32_t start = i;
+                while (i < n && isOpChar(aLine[(size_t)i])) ++i;
+                aoTokens.push_back({start, i - start, Code::Col_Operator});
+                continue;
+            }
+            if (isPunct(c)) {
+                aoTokens.push_back({i, 1, Code::Col_Punctuation});
+                ++i;
+                continue;
+            }
+            ++i;  // skip unknown byte
         }
-        if (isLetter(c)) {
-            const int32_t start = i;
-            while (i < n && isAlnum(aLine[(size_t)i])) ++i;
-            aoTokens.push_back({start, i - start, classifyCppWord(aLine.substr((size_t)start, (size_t)(i - start)))});
-            continue;
-        }
-        if (isOpChar(c)) {
-            const int32_t start = i;
-            while (i < n && isOpChar(aLine[(size_t)i])) ++i;
-            aoTokens.push_back({start, i - start, Code::Col_Operator});
-            continue;
-        }
-        if (isPunct(c)) {
-            aoTokens.push_back({i, 1, Code::Col_Punctuation});
-            ++i;
-            continue;
-        }
-        ++i;  // skip unknown byte
+        aoOutState.inBlockComment = block;
     }
-    aoInBlock = block;
+
+private:
+    static bool isLetter(char aChar) { return (aChar >= 'a' && aChar <= 'z') || (aChar >= 'A' && aChar <= 'Z') || aChar == '_'; }
+    static bool isDigit(char aChar)  { return aChar >= '0' && aChar <= '9'; }
+    static bool isAlnum(char aChar)  { return isLetter(aChar) || isDigit(aChar); }
+    static bool isOpChar(char aChar) { return aChar != 0 && std::strchr("+-*/%=<>!&|^~?:.", aChar) != nullptr; }
+    static bool isPunct(char aChar)  { return aChar != 0 && std::strchr("(){}[];,", aChar) != nullptr; }
+
+    static int32_t classifyWord(const std::string& aWord) {
+        static const std::unordered_set<std::string> keywords = {
+            "alignas", "alignof", "asm", "break", "case", "catch", "class", "concept", "const", "consteval", "constexpr",
+            "constinit", "const_cast", "continue", "decltype", "default", "delete", "do", "dynamic_cast", "else", "enum",
+            "explicit", "export", "extern", "false", "for", "friend", "goto", "if", "inline", "mutable", "namespace", "new",
+            "noexcept", "nullptr", "operator", "private", "protected", "public", "register", "reinterpret_cast", "requires",
+            "return", "sizeof", "static", "static_assert", "static_cast", "struct", "switch", "template", "this", "thread_local",
+            "throw", "true", "try", "typedef", "typeid", "typename", "union", "using", "virtual", "volatile", "while"};
+        static const std::unordered_set<std::string> types = {
+            "auto", "bool", "char", "char8_t", "char16_t", "char32_t", "double", "float", "int", "long", "short", "signed",
+            "unsigned", "void", "wchar_t", "size_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
+            "uint32_t", "uint64_t"};
+        if (keywords.count(aWord) != 0) return Code::Col_Keyword;
+        if (types.count(aWord) != 0) return Code::Col_Type;
+        return Code::Col_Identifier;
+    }
+};
+
+// Returns the lexer for a language name, or nullptr for plain (uncolored) text.
+const Lexer* lexerForLanguage(const std::string& aName) {
+    static const CppLexer cppLexer;
+    if (aName == "cpp" || aName == "c" || aName == "glsl") return &cppLexer;
+    return nullptr;
 }
 
 }  // namespace
@@ -265,17 +291,15 @@ struct Code::Impl {
         }
         m_maxLineChars = maxc;
     }
-    bool isCppLike() const {
-        return m_languageName == "cpp" || m_languageName == "c" || m_languageName == "glsl";
-    }
     void relex() {
         m_lineTokens.assign(m_lines.size(), std::vector<LexToken>());
-        if (!isCppLike()) return;
-        bool block = false;
+        const Lexer* lexer = lexerForLanguage(m_languageName);
+        if (lexer == nullptr) return;
+        LexState state;
         for (size_t i = 0; i < m_lines.size(); ++i) {
-            bool outBlock = false;
-            lexCppLine(m_lines[i], block, m_lineTokens[i], outBlock);
-            block = outBlock;
+            LexState outState;
+            lexer->lexLine(m_lines[i], state, m_lineTokens[i], outState);
+            state = outState;
         }
     }
     void afterContentChanged() {
