@@ -520,6 +520,9 @@ struct Code::Impl {
     Matcher*            m_matcher{};
     CompletionProvider* m_completion{};
     std::function<void(int32_t)> m_gutterClick;
+    std::vector<Marker>     m_markers;
+    std::vector<Decoration> m_decorations;
+    std::vector<Diagnostic> m_diagnostics;
 
     Impl() {
         m_style.colors[Col_Background]  = IM_COL32(30, 30, 30, 255);
@@ -538,7 +541,9 @@ struct Code::Impl {
         m_style.colors[Col_Preproc]     = IM_COL32(155, 155, 155, 255);
         m_style.colors[Col_Operator]    = IM_COL32(200, 200, 200, 255);
         m_style.colors[Col_Punctuation] = IM_COL32(200, 200, 200, 255);
-        m_style.colors[Col_SearchMatch] = IM_COL32(130, 100, 40, 140);
+        m_style.colors[Col_SearchMatch]   = IM_COL32(130, 100, 40, 140);
+        m_style.colors[Col_MarkerError]   = IM_COL32(220, 80, 80, 255);
+        m_style.colors[Col_MarkerWarning] = IM_COL32(220, 180, 60, 255);
         for (int32_t idx = 0; idx < Col_COUNT; ++idx) {
             if (m_style.colors[idx] == 0) {
                 m_style.colors[idx] = m_style.colors[Col_Default];
@@ -1120,9 +1125,17 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
     const bool hovered = ImGui::IsWindowHovered();
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         ImGui::SetWindowFocus();
-        const Pos p = posFromMouse(ImGui::GetMousePos());
-        impl.place(p, ImGui::GetIO().KeyShift);
-        impl.m_desiredColumn = p.column;
+        const ImVec2 mouse = ImGui::GetMousePos();
+        if (mouse.x < winPos.x + gutterW) {  // gutter click -> host callback (e.g. breakpoint toggle)
+            if (impl.m_gutterClick) {
+                const int32_t ln = (int32_t)((mouse.y - contentOrigin.y) / lineH);
+                if (ln >= 0 && ln <= impl.lastLineIndex()) impl.m_gutterClick(ln);
+            }
+        } else {
+            const Pos p = posFromMouse(mouse);
+            impl.place(p, ImGui::GetIO().KeyShift);
+            impl.m_desiredColumn = p.column;
+        }
     }
     const bool focused = ImGui::IsWindowFocused();
     if (focused && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
@@ -1291,6 +1304,54 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
         }
     }
 
+    // decorations + diagnostics (single-line in v1) — underline / squiggle / box + hover message
+    const float decoThickness = (impl.m_zoom > 1.0f) ? impl.m_zoom : 1.0f;
+    auto drawSquiggle = [&](float aX0, float aX1, float aY, ImU32 aColor) {
+        const float amp    = 2.0f * impl.m_zoom;  // amplitude + period grow with the zoom
+        const float period = 4.0f * impl.m_zoom;
+        float x = aX0;
+        bool up = true;
+        while (x < aX1) {
+            const float nx = (x + period < aX1) ? (x + period) : aX1;
+            drawList->AddLine(ImVec2(x, aY + (up ? 0.0f : amp)), ImVec2(nx, aY + (up ? amp : 0.0f)), aColor, decoThickness);
+            x = nx;
+            up = !up;
+        }
+    };
+    for (size_t d = 0; d < impl.m_decorations.size(); ++d) {
+        const Decoration& dec = impl.m_decorations[d];
+        const int32_t ln = dec.range.start.line;
+        if (ln != dec.range.end.line || ln < firstLine || ln >= lastLine) continue;
+        const float y    = contentOrigin.y + (float)ln * lineH;
+        const float x0   = textOriginX + (float)dec.range.start.column * charWidth;
+        const float x1   = textOriginX + (float)dec.range.end.column * charWidth;
+        const float base = y + glyphY + fontHeight;
+        if (dec.kind == DecoKind::Box) {
+            drawList->AddRect(ImVec2(x0, y + glyphY), ImVec2(x1, y + glyphY + fontHeight), dec.color, 0.0f, 0, decoThickness);
+        } else if (dec.kind == DecoKind::Squiggle) {
+            drawSquiggle(x0, x1, base - 2.0f, dec.color);
+        } else {  // Underline (Background renders as underline in v1)
+            drawList->AddLine(ImVec2(x0, base), ImVec2(x1, base), dec.color, decoThickness);
+        }
+
+        if (!dec.message.empty() && ImGui::IsMouseHoveringRect(ImVec2(x0, y), ImVec2(x1, y + lineH))) {
+            ImGui::SetTooltip("%s", dec.message.c_str());
+        }
+    }
+    for (size_t g = 0; g < impl.m_diagnostics.size(); ++g) {
+        const Diagnostic& diag = impl.m_diagnostics[g];
+        const int32_t ln = diag.range.start.line;
+        if (ln != diag.range.end.line || ln < firstLine || ln >= lastLine) continue;
+        const ImU32 col  = (diag.severity == Severity::Error) ? style.colors[Col_MarkerError] : style.colors[Col_MarkerWarning];
+        const float y    = contentOrigin.y + (float)ln * lineH;
+        const float x0   = textOriginX + (float)diag.range.start.column * charWidth;
+        const float x1   = textOriginX + (float)diag.range.end.column * charWidth;
+        drawSquiggle(x0, x1, y + glyphY + fontHeight - 2.0f, col);
+        if (!diag.message.empty() && ImGui::IsMouseHoveringRect(ImVec2(x0, y), ImVec2(x1, y + lineH))) {
+            ImGui::SetTooltip("%s", diag.message.c_str());
+        }
+    }
+
     // gutter (fixed horizontally) + line numbers
     drawList->AddRectFilled(ImVec2(winPos.x, winPos.y), ImVec2(winPos.x + gutterW, winPos.y + winSize.y), colGutter);
     char numberText[16];
@@ -1299,6 +1360,21 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
         snprintf(numberText, sizeof(numberText), "%d", i + 1);
         const float textWidth = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, numberText).x;
         drawList->AddText(font, fontSize, ImVec2(winPos.x + gutterW - pad - textWidth, y), colNumber, numberText);
+    }
+
+    // gutter markers (host-registered; icon + hover message)
+    for (size_t mk = 0; mk < impl.m_markers.size(); ++mk) {
+        const Marker& mark = impl.m_markers[mk];
+        if (mark.line < firstLine || mark.line >= lastLine) continue;
+        const float y      = contentOrigin.y + (float)mark.line * lineH;
+        const float cx     = winPos.x + charWidth * 0.6f;
+        const float cy     = y + lineH * 0.5f;
+        const float radius = charWidth * 0.35f;
+        const ImU32 col    = (mark.iconColor != 0) ? mark.iconColor : style.colors[Col_MarkerError];
+        drawList->AddCircleFilled(ImVec2(cx, cy), radius, col);
+        if (!mark.message.empty() && ImGui::IsMouseHoveringRect(ImVec2(winPos.x, y), ImVec2(winPos.x + gutterW, y + lineH))) {
+            ImGui::SetTooltip("%s", mark.message.c_str());
+        }
     }
 
     // caret (blinking, only when focused)
@@ -1416,9 +1492,9 @@ int32_t Code::replaceAll(const char* aReplacement) {
 // ---------------------------------------------------------------------------
 // Markers / decorations / diagnostics — stored, rendered in later steps
 // ---------------------------------------------------------------------------
-void Code::setMarkers(const std::vector<Marker>&) {}
-void Code::setDecorations(const std::vector<Decoration>&) {}
-void Code::setDiagnostics(const std::vector<Diagnostic>&) {}
+void Code::setMarkers(const std::vector<Marker>& aMarkers) { mp_impl->m_markers = aMarkers; }
+void Code::setDecorations(const std::vector<Decoration>& aDecorations) { mp_impl->m_decorations = aDecorations; }
+void Code::setDiagnostics(const std::vector<Diagnostic>& aDiagnostics) { mp_impl->m_diagnostics = aDiagnostics; }
 void Code::setGutterClickCallback(std::function<void(int32_t aLine)> aCallback) {
     mp_impl->m_gutterClick = std::move(aCallback);
 }
