@@ -24,10 +24,11 @@ SOFTWARE.
 
 #pragma once
 
-// ImCode, v0.1.0
+// ImCode, v0.1.0  -  requires C++14 minimum
+//   (uses std::make_unique + aggregate init of NSDMI structs; no C++17 feature).
 // Standalone Dear ImGui code editor. ImGui-only, no third-party deps.
-// Piece-tree text model + lazy/threaded tokenization + virtualized render.
-// Public API surface only (v0): declarations, no implementation yet.
+// v1 backing store is a simple line vector; the piece-tree / threaded engine
+// replaces it later behind this same public API.
 
 #define IMCODE_VERSION     "0.1.0"
 #define IMCODE_VERSION_NUM 00100
@@ -104,6 +105,7 @@ public:
     // ---- value types ({}-init, camelCase fields) ----
     struct Pos   { int32_t line{}; int32_t column{}; };  // column = display column (tab-expanded)
     struct Range { Pos start{}; Pos end{}; };
+    struct Token { int32_t startColumn{}; int32_t length{}; Col color{}; };  // a colored run on one line
 
     struct Style {
         ImU32   colors[Col_COUNT]{};  // a 0 entry resolves to the builtin dark default
@@ -173,6 +175,7 @@ public:
     std::string getText() const;                            // small-file convenience
     void        enumerateSpans(const std::function<void(const char* aData, uint64_t aLen)>& aVisitor) const;  // save walk
     void        setLanguage(const char* aName);             // "cpp" / "glsl" / "sql" / "lua"
+    void        getLineTokens(int32_t aLine, std::vector<Token>& aoTokens) const;  // colored tokens for one line
 
     // ---- frame entry ----
     bool Render(const char* aId, const ImVec2& aSize);  // draw + handle input; true if content changed

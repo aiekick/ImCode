@@ -46,8 +46,18 @@ struct LexToken {
 
 // Per-line carry state between consecutive lines (small, trivially copyable).
 struct LexState {
-    bool inBlockComment{};
+    bool    inBlockComment{};    // C-like and SQL  /* */
+    int32_t luaLongLevel{-1};    // Lua long bracket level (-1 = none); [==[ -> 2
+    bool    luaLongIsComment{};  // Lua long bracket is a comment (vs a string)
 };
+
+// Shared char-class helpers (used by every lexer).
+inline bool isLetter(char aChar) { return (aChar >= 'a' && aChar <= 'z') || (aChar >= 'A' && aChar <= 'Z') || aChar == '_'; }
+inline bool isDigit(char aChar)  { return aChar >= '0' && aChar <= '9'; }
+inline bool isAlnum(char aChar)  { return isLetter(aChar) || isDigit(aChar); }
+inline bool isOpChar(char aChar) { return aChar != 0 && std::strchr("+-*/%=<>!&|^~?:.#", aChar) != nullptr; }
+inline bool isPunct(char aChar)  { return aChar != 0 && std::strchr("(){}[];,", aChar) != nullptr; }
+inline bool inSet(const std::string& aWord, const std::unordered_set<std::string>& aSet) { return aSet.count(aWord) != 0; }
 
 // Abstract lexer interface — one concrete implementation per language.
 // File-local for v1; can be promoted to the public header so hosts register
@@ -58,8 +68,9 @@ public:
     virtual void lexLine(const std::string& aLine, const LexState& aInState, std::vector<LexToken>& aoTokens, LexState& aoOutState) const = 0;
 };
 
-// C / C++ / GLSL (close enough for v1).
-class CppLexer final : public Lexer {
+// Shared C-like lexing (comments, strings, numbers, operators). Subclasses
+// only provide the keyword / type vocabulary via classifyWord().
+class CLikeLexer : public Lexer {
 public:
     void lexLine(const std::string& aLine, const LexState& aInState, std::vector<LexToken>& aoTokens, LexState& aoOutState) const override {
         aoTokens.clear();
@@ -158,14 +169,14 @@ public:
         aoOutState.inBlockComment = block;
     }
 
-private:
-    static bool isLetter(char aChar) { return (aChar >= 'a' && aChar <= 'z') || (aChar >= 'A' && aChar <= 'Z') || aChar == '_'; }
-    static bool isDigit(char aChar)  { return aChar >= '0' && aChar <= '9'; }
-    static bool isAlnum(char aChar)  { return isLetter(aChar) || isDigit(aChar); }
-    static bool isOpChar(char aChar) { return aChar != 0 && std::strchr("+-*/%=<>!&|^~?:.", aChar) != nullptr; }
-    static bool isPunct(char aChar)  { return aChar != 0 && std::strchr("(){}[];,", aChar) != nullptr; }
+protected:
+    virtual int32_t classifyWord(const std::string& aWord) const = 0;
+};
 
-    static int32_t classifyWord(const std::string& aWord) {
+// C and C++.
+class CppLexer final : public CLikeLexer {
+protected:
+    int32_t classifyWord(const std::string& aWord) const override {
         static const std::unordered_set<std::string> keywords = {
             "alignas", "alignof", "asm", "break", "case", "catch", "class", "concept", "const", "consteval", "constexpr",
             "constinit", "const_cast", "continue", "decltype", "default", "delete", "do", "dynamic_cast", "else", "enum",
@@ -177,8 +188,268 @@ private:
             "auto", "bool", "char", "char8_t", "char16_t", "char32_t", "double", "float", "int", "long", "short", "signed",
             "unsigned", "void", "wchar_t", "size_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
             "uint32_t", "uint64_t"};
-        if (keywords.count(aWord) != 0) return Code::Col_Keyword;
-        if (types.count(aWord) != 0) return Code::Col_Type;
+        if (inSet(aWord, keywords)) return Code::Col_Keyword;
+        if (inSet(aWord, types)) return Code::Col_Type;
+        return Code::Col_Identifier;
+    }
+};
+
+// GLSL (same C-like syntax; different keyword / type vocabulary).
+class GlslLexer final : public CLikeLexer {
+protected:
+    int32_t classifyWord(const std::string& aWord) const override {
+        static const std::unordered_set<std::string> keywords = {
+            "attribute", "const", "uniform", "varying", "buffer", "shared", "coherent", "volatile", "restrict", "readonly",
+            "writeonly", "layout", "centroid", "flat", "smooth", "noperspective", "patch", "sample", "in", "out", "inout",
+            "invariant", "precise", "discard", "return", "if", "else", "switch", "case", "default", "subroutine", "while",
+            "do", "for", "break", "continue", "true", "false", "precision", "highp", "mediump", "lowp", "struct"};
+        static const std::unordered_set<std::string> types = {
+            "void", "bool", "int", "uint", "float", "double", "vec2", "vec3", "vec4", "bvec2", "bvec3", "bvec4", "ivec2",
+            "ivec3", "ivec4", "uvec2", "uvec3", "uvec4", "dvec2", "dvec3", "dvec4", "mat2", "mat3", "mat4", "mat2x2", "mat2x3",
+            "mat2x4", "mat3x2", "mat3x3", "mat3x4", "mat4x2", "mat4x3", "mat4x4", "dmat2", "dmat3", "dmat4", "sampler1D",
+            "sampler2D", "sampler3D", "samplerCube", "sampler2DArray", "samplerCubeArray", "sampler2DShadow", "samplerCubeShadow",
+            "sampler2DRect", "isampler2D", "isampler3D", "usampler2D", "usampler3D", "sampler2DMS", "image2D", "iimage2D",
+            "uimage2D", "atomic_uint"};
+        if (inSet(aWord, keywords)) return Code::Col_Keyword;
+        if (inSet(aWord, types)) return Code::Col_Type;
+        return Code::Col_Identifier;
+    }
+};
+
+// Lua: -- line comments, --[[ ]] / [[ ]] long brackets (multi-line, level-aware),
+// "..." / '...' short strings. '#' is the length operator (handled via isOpChar).
+class LuaLexer final : public Lexer {
+public:
+    void lexLine(const std::string& aLine, const LexState& aInState, std::vector<LexToken>& aoTokens, LexState& aoOutState) const override {
+        aoTokens.clear();
+        const int32_t n = (int32_t)aLine.size();
+        int32_t i = 0;
+        int32_t longLevel = aInState.luaLongLevel;
+        bool longIsComment = aInState.luaLongIsComment;
+        while (i < n) {
+            if (longLevel >= 0) {  // inside a long bracket carried from a previous line
+                const int32_t start = i;
+                const bool closed = scanLongClose(aLine, i, longLevel);
+                const int32_t color = longIsComment ? Code::Col_Comment : Code::Col_String;
+                aoTokens.push_back({start, i - start, color});
+                if (closed) longLevel = -1;
+                continue;
+            }
+            const char c = aLine[(size_t)i];
+            if (c == ' ' || c == '\t') { ++i; continue; }
+            if (c == '-' && i + 1 < n && aLine[(size_t)(i + 1)] == '-') {
+                const int32_t lvl = longOpenLevel(aLine, i + 2);
+                if (lvl >= 0) {  // long comment --[=*[ ... ]=*]
+                    const int32_t start = i;
+                    i = i + 4 + lvl;  // skip "--" + "[" + lvl '=' + "["
+                    longLevel = lvl;
+                    longIsComment = true;
+                    if (scanLongClose(aLine, i, longLevel)) longLevel = -1;
+                    aoTokens.push_back({start, i - start, Code::Col_Comment});
+                    continue;
+                }
+                aoTokens.push_back({i, n - i, Code::Col_Comment});  // plain line comment
+                i = n;
+                continue;
+            }
+            if (c == '[') {
+                const int32_t lvl = longOpenLevel(aLine, i);
+                if (lvl >= 0) {  // long string [=*[ ... ]=*]
+                    const int32_t start = i;
+                    i = i + 2 + lvl;  // skip "[" + lvl '=' + "["
+                    longLevel = lvl;
+                    longIsComment = false;
+                    if (scanLongClose(aLine, i, longLevel)) longLevel = -1;
+                    aoTokens.push_back({start, i - start, Code::Col_String});
+                    continue;
+                }
+                aoTokens.push_back({i, 1, Code::Col_Punctuation});
+                ++i;
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                const char quote = c;
+                const int32_t start = i;
+                ++i;
+                while (i < n) {
+                    if (aLine[(size_t)i] == '\\' && i + 1 < n) { i += 2; continue; }
+                    if (aLine[(size_t)i] == quote) { ++i; break; }
+                    ++i;
+                }
+                aoTokens.push_back({start, i - start, Code::Col_String});
+                continue;
+            }
+            if (isDigit(c) || (c == '.' && i + 1 < n && isDigit(aLine[(size_t)(i + 1)]))) {
+                const int32_t start = i;
+                while (i < n) {
+                    const char d = aLine[(size_t)i];
+                    if (isAlnum(d) || d == '.') ++i;
+                    else if ((d == '+' || d == '-') && i > start && (aLine[(size_t)(i - 1)] == 'e' || aLine[(size_t)(i - 1)] == 'E')) ++i;
+                    else break;
+                }
+                aoTokens.push_back({start, i - start, Code::Col_Number});
+                continue;
+            }
+            if (isLetter(c)) {
+                const int32_t start = i;
+                while (i < n && isAlnum(aLine[(size_t)i])) ++i;
+                aoTokens.push_back({start, i - start, classifyWord(aLine.substr((size_t)start, (size_t)(i - start)))});
+                continue;
+            }
+            if (isOpChar(c)) {
+                const int32_t start = i;
+                while (i < n && isOpChar(aLine[(size_t)i])) ++i;
+                aoTokens.push_back({start, i - start, Code::Col_Operator});
+                continue;
+            }
+            if (isPunct(c)) { aoTokens.push_back({i, 1, Code::Col_Punctuation}); ++i; continue; }
+            ++i;
+        }
+        aoOutState.luaLongLevel = longLevel;
+        aoOutState.luaLongIsComment = longIsComment;
+    }
+
+private:
+    // at aPos, an opener [=*[ ? returns the '=' count (level) or -1.
+    static int32_t longOpenLevel(const std::string& aLine, int32_t aPos) {
+        const int32_t n = (int32_t)aLine.size();
+        if (aPos >= n || aLine[(size_t)aPos] != '[') return -1;
+        int32_t eq = 0;
+        int32_t j = aPos + 1;
+        while (j < n && aLine[(size_t)j] == '=') { ++eq; ++j; }
+        if (j < n && aLine[(size_t)j] == '[') return eq;
+        return -1;
+    }
+    // scan from aPos to a matching ]=*] of the given level; advance aPos; return true if closed on this line.
+    static bool scanLongClose(const std::string& aLine, int32_t& aPos, int32_t aLevel) {
+        const int32_t n = (int32_t)aLine.size();
+        while (aPos < n) {
+            if (aLine[(size_t)aPos] == ']') {
+                int32_t eq = 0;
+                int32_t j = aPos + 1;
+                while (j < n && aLine[(size_t)j] == '=') { ++eq; ++j; }
+                if (eq == aLevel && j < n && aLine[(size_t)j] == ']') { aPos = j + 1; return true; }
+            }
+            ++aPos;
+        }
+        return false;
+    }
+    static int32_t classifyWord(const std::string& aWord) {
+        static const std::unordered_set<std::string> keywords = {
+            "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in",
+            "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while"};
+        if (inSet(aWord, keywords)) return Code::Col_Keyword;
+        return Code::Col_Identifier;
+    }
+};
+
+// SQL: -- line comments, /* */ block comments, '...' strings ('' escaped),
+// "..." quoted identifiers, case-INSENSITIVE keywords/types.
+class SqlLexer final : public Lexer {
+public:
+    void lexLine(const std::string& aLine, const LexState& aInState, std::vector<LexToken>& aoTokens, LexState& aoOutState) const override {
+        aoTokens.clear();
+        const int32_t n = (int32_t)aLine.size();
+        int32_t i = 0;
+        bool block = aInState.inBlockComment;
+        while (i < n) {
+            if (block) {
+                const int32_t start = i;
+                while (i < n) {
+                    if (aLine[(size_t)i] == '*' && i + 1 < n && aLine[(size_t)(i + 1)] == '/') { i += 2; block = false; break; }
+                    ++i;
+                }
+                aoTokens.push_back({start, i - start, Code::Col_Comment});
+                continue;
+            }
+            const char c = aLine[(size_t)i];
+            if (c == ' ' || c == '\t') { ++i; continue; }
+            if (c == '-' && i + 1 < n && aLine[(size_t)(i + 1)] == '-') {
+                aoTokens.push_back({i, n - i, Code::Col_Comment});
+                i = n;
+                continue;
+            }
+            if (c == '/' && i + 1 < n && aLine[(size_t)(i + 1)] == '*') {
+                const int32_t start = i;
+                i += 2;
+                block = true;
+                while (i < n) {
+                    if (aLine[(size_t)i] == '*' && i + 1 < n && aLine[(size_t)(i + 1)] == '/') { i += 2; block = false; break; }
+                    ++i;
+                }
+                aoTokens.push_back({start, i - start, Code::Col_Comment});
+                continue;
+            }
+            if (c == '\'') {
+                const int32_t start = i;
+                ++i;
+                while (i < n) {
+                    if (aLine[(size_t)i] == '\'') {
+                        if (i + 1 < n && aLine[(size_t)(i + 1)] == '\'') { i += 2; continue; }  // '' escape
+                        ++i;
+                        break;
+                    }
+                    ++i;
+                }
+                aoTokens.push_back({start, i - start, Code::Col_String});
+                continue;
+            }
+            if (c == '"') {
+                const int32_t start = i;
+                ++i;
+                while (i < n) {
+                    if (aLine[(size_t)i] == '"') { ++i; break; }
+                    ++i;
+                }
+                aoTokens.push_back({start, i - start, Code::Col_String});
+                continue;
+            }
+            if (isDigit(c) || (c == '.' && i + 1 < n && isDigit(aLine[(size_t)(i + 1)]))) {
+                const int32_t start = i;
+                while (i < n) {
+                    const char d = aLine[(size_t)i];
+                    if (isAlnum(d) || d == '.') ++i;
+                    else if ((d == '+' || d == '-') && i > start && (aLine[(size_t)(i - 1)] == 'e' || aLine[(size_t)(i - 1)] == 'E')) ++i;
+                    else break;
+                }
+                aoTokens.push_back({start, i - start, Code::Col_Number});
+                continue;
+            }
+            if (isLetter(c)) {
+                const int32_t start = i;
+                while (i < n && isAlnum(aLine[(size_t)i])) ++i;
+                aoTokens.push_back({start, i - start, classifyWord(aLine.substr((size_t)start, (size_t)(i - start)))});
+                continue;
+            }
+            if (isOpChar(c)) {
+                const int32_t start = i;
+                while (i < n && isOpChar(aLine[(size_t)i])) ++i;
+                aoTokens.push_back({start, i - start, Code::Col_Operator});
+                continue;
+            }
+            if (isPunct(c)) { aoTokens.push_back({i, 1, Code::Col_Punctuation}); ++i; continue; }
+            ++i;
+        }
+        aoOutState.inBlockComment = block;
+    }
+
+private:
+    static int32_t classifyWord(const std::string& aWord) {
+        std::string upper = aWord;
+        for (size_t k = 0; k < upper.size(); ++k) {
+            if (upper[k] >= 'a' && upper[k] <= 'z') upper[k] = (char)(upper[k] - 'a' + 'A');
+        }
+        static const std::unordered_set<std::string> keywords = {
+            "SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "CREATE", "TABLE", "DROP",
+            "ALTER", "ADD", "COLUMN", "INDEX", "VIEW", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER", "ON", "AS",
+            "AND", "OR", "NOT", "NULL", "IS", "IN", "LIKE", "BETWEEN", "GROUP", "BY", "ORDER", "HAVING", "DISTINCT",
+            "LIMIT", "OFFSET", "UNION", "ALL", "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END", "PRIMARY", "KEY",
+            "FOREIGN", "REFERENCES", "DEFAULT", "UNIQUE", "CONSTRAINT", "ASC", "DESC", "COUNT", "SUM", "AVG", "MIN", "MAX"};
+        static const std::unordered_set<std::string> types = {
+            "INT", "INTEGER", "SMALLINT", "BIGINT", "DECIMAL", "NUMERIC", "FLOAT", "REAL", "DOUBLE", "CHAR", "VARCHAR",
+            "TEXT", "DATE", "TIME", "TIMESTAMP", "DATETIME", "BOOLEAN", "BOOL", "BLOB", "BINARY"};
+        if (inSet(upper, keywords)) return Code::Col_Keyword;
+        if (inSet(upper, types)) return Code::Col_Type;
         return Code::Col_Identifier;
     }
 };
@@ -186,7 +457,13 @@ private:
 // Returns the lexer for a language name, or nullptr for plain (uncolored) text.
 const Lexer* lexerForLanguage(const std::string& aName) {
     static const CppLexer cppLexer;
-    if (aName == "cpp" || aName == "c" || aName == "glsl") return &cppLexer;
+    static const GlslLexer glslLexer;
+    static const LuaLexer luaLexer;
+    static const SqlLexer sqlLexer;
+    if (aName == "cpp" || aName == "c") return &cppLexer;
+    if (aName == "glsl") return &glslLexer;
+    if (aName == "lua") return &luaLexer;
+    if (aName == "sql") return &sqlLexer;
     return nullptr;
 }
 
@@ -608,6 +885,22 @@ void Code::setSource(DataSource* apSource) { mp_impl->m_dataSource = apSource; }
 void Code::setLanguage(const char* aName) {
     mp_impl->m_languageName = (aName != nullptr) ? aName : "";
     mp_impl->relex();
+}
+
+void Code::getLineTokens(int32_t aLine, std::vector<Token>& aoTokens) const {
+    aoTokens.clear();
+    if (aLine < 0 || aLine >= (int32_t)mp_impl->m_lineTokens.size()) {
+        return;
+    }
+    const std::vector<LexToken>& source = mp_impl->m_lineTokens[(size_t)aLine];
+    aoTokens.reserve(source.size());
+    for (const LexToken& token : source) {
+        Token out;
+        out.startColumn = token.start;
+        out.length      = token.length;
+        out.color       = token.color;
+        aoTokens.push_back(out);
+    }
 }
 
 // ---------------------------------------------------------------------------
