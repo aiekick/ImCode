@@ -503,6 +503,17 @@ struct Code::Impl {
     std::vector<UndoEntry> m_redoStack;
     EditKind               m_lastEditKind{EditKind::Other};
 
+    // find / replace (literal v1)
+    std::string        m_searchPattern;
+    FindFlags          m_searchFlags{};
+    std::vector<Range> m_matches;
+    int32_t            m_currentMatch{-1};
+    bool               m_findBarOpen{};
+    bool               m_findBarReplaceMode{};
+    bool               m_findBarFocus{};
+    char               m_findInput[256]{};
+    char               m_replaceInput[256]{};
+
     // host-pluggable providers (null -> builtin default; wired in later steps)
     DataSource*         m_dataSource{};
     Executor*           m_executor{};
@@ -527,6 +538,7 @@ struct Code::Impl {
         m_style.colors[Col_Preproc]     = IM_COL32(155, 155, 155, 255);
         m_style.colors[Col_Operator]    = IM_COL32(200, 200, 200, 255);
         m_style.colors[Col_Punctuation] = IM_COL32(200, 200, 200, 255);
+        m_style.colors[Col_SearchMatch] = IM_COL32(130, 100, 40, 140);
         for (int32_t idx = 0; idx < Col_COUNT; ++idx) {
             if (m_style.colors[idx] == 0) {
                 m_style.colors[idx] = m_style.colors[Col_Default];
@@ -585,6 +597,7 @@ struct Code::Impl {
         m_desiredColumn = m_cursor.column;
         recomputeMaxLineChars();
         relex();
+        if (!m_searchPattern.empty()) computeMatches();
         m_ensureCursorVisible = true;
     }
 
@@ -810,6 +823,103 @@ struct Code::Impl {
         m_anchor.column = (m_anchor.column > m_style.tabWidth) ? m_anchor.column - m_style.tabWidth : 0;
         afterContentChanged();
     }
+
+    // --- find / replace (literal, single-line matches) ---
+    static void toLowerInPlace(std::string& aStr) {
+        for (size_t k = 0; k < aStr.size(); ++k) {
+            if (aStr[k] >= 'A' && aStr[k] <= 'Z') aStr[k] = (char)(aStr[k] - 'A' + 'a');
+        }
+    }
+    static bool isWordChar(char aChar) {
+        return (aChar >= 'a' && aChar <= 'z') || (aChar >= 'A' && aChar <= 'Z') || (aChar >= '0' && aChar <= '9') || aChar == '_';
+    }
+    void computeMatches() {
+        m_matches.clear();
+        m_currentMatch = -1;
+        if (m_searchPattern.empty()) return;
+        const bool ci = (m_searchFlags & FindFlags_CaseInsensitive) != 0;
+        const bool ww = (m_searchFlags & FindFlags_WholeWord) != 0;
+        std::string pat = m_searchPattern;
+        if (ci) toLowerInPlace(pat);
+        if (pat.empty()) return;
+        for (int32_t ln = 0; ln <= lastLineIndex(); ++ln) {
+            const std::string& original = m_lines[(size_t)ln];
+            std::string hay = original;
+            if (ci) toLowerInPlace(hay);
+            size_t pos = 0;
+            while (true) {
+                const size_t found = hay.find(pat, pos);
+                if (found == std::string::npos) break;
+                const int32_t start = (int32_t)found;
+                const int32_t end = start + (int32_t)pat.size();
+                bool ok = true;
+                if (ww) {
+                    const bool left = (start == 0) || !isWordChar(original[(size_t)(start - 1)]);
+                    const bool right = (end >= (int32_t)original.size()) || !isWordChar(original[(size_t)end]);
+                    ok = left && right;
+                }
+                if (ok) m_matches.push_back(Range{Pos{ln, start}, Pos{ln, end}});
+                pos = found + pat.size();
+            }
+        }
+    }
+    bool selectMatch(int32_t aIndex) {
+        if (aIndex < 0 || aIndex >= (int32_t)m_matches.size()) return false;
+        m_currentMatch = aIndex;
+        const Range r = m_matches[(size_t)aIndex];
+        m_anchor = clampPos(r.start);
+        m_cursor = clampPos(r.end);
+        m_desiredColumn = m_cursor.column;
+        m_ensureCursorVisible = true;
+        m_lastEditKind = EditKind::Other;
+        return true;
+    }
+    bool findRelative(bool aForward) {
+        if (m_matches.empty()) return false;
+        if (m_currentMatch >= 0) {
+            int32_t next = aForward ? (m_currentMatch + 1) : (m_currentMatch - 1);
+            if (next < 0) next = (int32_t)m_matches.size() - 1;
+            if (next >= (int32_t)m_matches.size()) next = 0;
+            return selectMatch(next);
+        }
+        const Pos ref = m_cursor;
+        if (aForward) {
+            for (size_t k = 0; k < m_matches.size(); ++k) {
+                if (!posLess(m_matches[k].start, ref)) return selectMatch((int32_t)k);
+            }
+            return selectMatch(0);
+        }
+        for (int32_t k = (int32_t)m_matches.size() - 1; k >= 0; --k) {
+            if (posLess(m_matches[(size_t)k].start, ref)) return selectMatch(k);
+        }
+        return selectMatch((int32_t)m_matches.size() - 1);
+    }
+    bool replaceCurrentMatch(const std::string& aReplacement) {
+        if (m_currentMatch < 0 || m_currentMatch >= (int32_t)m_matches.size()) return false;
+        const Range r = m_matches[(size_t)m_currentMatch];
+        snapshotForUndo(EditKind::Other);
+        deleteRange(r.start, r.end);
+        m_cursor = r.start;
+        m_anchor = r.start;
+        const Pos end = insertTextAt(m_cursor, aReplacement);
+        m_cursor = end;
+        m_anchor = end;
+        afterContentChanged();
+        return true;
+    }
+    int32_t replaceAllMatches(const std::string& aReplacement) {
+        if (m_matches.empty()) return 0;
+        snapshotForUndo(EditKind::Other);
+        const std::vector<Range> matches = m_matches;  // replace last-to-first to keep earlier positions valid
+        for (int32_t k = (int32_t)matches.size() - 1; k >= 0; --k) {
+            deleteRange(matches[(size_t)k].start, matches[(size_t)k].end);
+            insertTextAt(matches[(size_t)k].start, aReplacement);
+        }
+        m_cursor = clampPos(m_cursor);
+        m_anchor = m_cursor;
+        afterContentChanged();
+        return (int32_t)matches.size();
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -910,15 +1020,62 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
     Impl&        impl  = *mp_impl;
     const Style& style = impl.m_style;
 
-    if (style.font != nullptr) ImGui::PushFont(style.font);
-
     ImVec2 size = aSize;
     if (size.x <= 0.0f) size.x = ImGui::GetContentRegionAvail().x;
     if (size.y <= 0.0f) size.y = ImGui::GetContentRegionAvail().y;
 
+    // find / replace bar (UI font, docked at the top of the editor area)
+    float barHeight = 0.0f;
+    if (impl.m_findBarOpen) {
+        const float yBefore = ImGui::GetCursorPosY();
+        ImGui::PushID("##imcode_find");
+        if (impl.m_findBarFocus) { ImGui::SetKeyboardFocusHere(); impl.m_findBarFocus = false; }
+        ImGui::SetNextItemWidth(220.0f);
+        const bool enterFind  = ImGui::InputTextWithHint("##find", "Find", impl.m_findInput, (int)sizeof(impl.m_findInput), ImGuiInputTextFlags_EnterReturnsTrue);
+        const bool editedFind = ImGui::IsItemEdited();
+        ImGui::SameLine();
+        if (ImGui::ArrowButton("##prev", ImGuiDir_Up)) findPrev();
+        ImGui::SameLine();
+        if (ImGui::ArrowButton("##next", ImGuiDir_Down)) findNext();
+        ImGui::SameLine();
+        ImGui::Text("%d/%d", (impl.m_currentMatch >= 0 ? impl.m_currentMatch + 1 : 0), (int)impl.m_matches.size());
+        ImGui::SameLine();
+        bool caseInsensitive = (impl.m_searchFlags & FindFlags_CaseInsensitive) != 0;
+        if (ImGui::Checkbox("Aa", &caseInsensitive)) {
+            impl.m_searchFlags = caseInsensitive ? (impl.m_searchFlags | FindFlags_CaseInsensitive) : (impl.m_searchFlags & ~FindFlags_CaseInsensitive);
+            setSearch(impl.m_findInput, impl.m_searchFlags);
+        }
+        ImGui::SameLine();
+        bool wholeWord = (impl.m_searchFlags & FindFlags_WholeWord) != 0;
+        if (ImGui::Checkbox("W", &wholeWord)) {
+            impl.m_searchFlags = wholeWord ? (impl.m_searchFlags | FindFlags_WholeWord) : (impl.m_searchFlags & ~FindFlags_WholeWord);
+            setSearch(impl.m_findInput, impl.m_searchFlags);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x")) { clearSearch(); impl.m_findBarOpen = false; }
+        if (editedFind) setSearch(impl.m_findInput, impl.m_searchFlags);
+        if (enterFind) findNext();
+        if (impl.m_findBarReplaceMode) {
+            ImGui::SetNextItemWidth(220.0f);
+            const bool enterReplace = ImGui::InputTextWithHint("##replace", "Replace", impl.m_replaceInput, (int)sizeof(impl.m_replaceInput), ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Replace")) replaceCurrent(impl.m_replaceInput);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("All")) replaceAll(impl.m_replaceInput);
+            if (enterReplace) replaceCurrent(impl.m_replaceInput);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { impl.m_findBarOpen = false; clearSearch(); }
+        ImGui::PopID();
+        barHeight = ImGui::GetCursorPosY() - yBefore;
+    }
+
+    float textHeight = size.y - barHeight;
+    if (textHeight < 1.0f) textHeight = 1.0f;
+
+    if (style.font != nullptr) ImGui::PushFont(style.font);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, style.colors[Col_Background]);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    ImGui::BeginChild(aId, size, 0, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNavInputs | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::BeginChild(aId, ImVec2(size.x, textHeight), 0, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoNavInputs | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
 
     ImDrawList* drawList     = ImGui::GetWindowDrawList();
@@ -948,7 +1105,7 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
 
     int32_t firstLine = (int32_t)(scrollY / lineH);
     if (firstLine < 0) firstLine = 0;
-    const int32_t pageLines = (int32_t)(size.y / lineH);
+    const int32_t pageLines = (int32_t)(textHeight / lineH);
     int32_t lastLine = firstLine + pageLines + 2;
     if (lastLine > lineCount) lastLine = lineCount;
 
@@ -1006,6 +1163,23 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
             ImGui::SetClipboardText(getSelectedText().c_str());
         }
 
+        // open the find / replace bar (find works in read-only; replace does not)
+        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_F)) {
+            impl.m_findBarOpen = true;
+            impl.m_findBarReplaceMode = false;
+            impl.m_findBarFocus = true;
+            const std::string sel = getSelectedText();
+            if (!sel.empty() && sel.find('\n') == std::string::npos) {
+                snprintf(impl.m_findInput, sizeof(impl.m_findInput), "%s", sel.c_str());
+                setSearch(impl.m_findInput, impl.m_searchFlags);
+            }
+        }
+        if (ctrl && (impl.m_config.flags & Flags_ReadOnly) == 0 && ImGui::IsKeyPressed(ImGuiKey_H)) {
+            impl.m_findBarOpen = true;
+            impl.m_findBarReplaceMode = true;
+            impl.m_findBarFocus = true;
+        }
+
         if ((impl.m_config.flags & Flags_ReadOnly) == 0) {
             if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z)) { shift ? impl.redo() : impl.undo(); }
             if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Y)) impl.redo();
@@ -1047,8 +1221,8 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
         const float cursorY = (float)impl.m_cursor.line * lineH;
         if (cursorY < scrollY) {
             ImGui::SetScrollY(cursorY);
-        } else if (cursorY + lineH > scrollY + size.y) {
-            ImGui::SetScrollY(cursorY + lineH - size.y);
+        } else if (cursorY + lineH > scrollY + textHeight) {
+            ImGui::SetScrollY(cursorY + lineH - textHeight);
         }
         impl.m_ensureCursorVisible = false;
     }
@@ -1084,6 +1258,19 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
             const float x0 = textOriginX + (float)c0 * charWidth;
             const float x1 = textOriginX + (float)c1 * charWidth;
             drawList->AddRectFilled(ImVec2(x0, y), ImVec2(x1 + 1.0f, y + lineH), colSel);
+        }
+    }
+
+    // search matches
+    if (!impl.m_matches.empty()) {
+        const ImU32 colMatch = style.colors[Col_SearchMatch];
+        for (size_t m = 0; m < impl.m_matches.size(); ++m) {
+            const Range& r = impl.m_matches[m];
+            if (r.start.line < firstLine || r.start.line >= lastLine) continue;
+            const float y  = contentOrigin.y + (float)r.start.line * lineH;
+            const float x0 = textOriginX + (float)r.start.column * charWidth;
+            const float x1 = textOriginX + (float)r.end.column * charWidth;
+            drawList->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + lineH), colMatch);
         }
     }
 
@@ -1197,6 +1384,33 @@ bool Code::execute(Command aCommand) {
         }
         default: return false;  // remaining modern commands land in later steps
     }
+}
+
+// ---------------------------------------------------------------------------
+// Find / replace (literal v1; the Matcher provider handles regex later)
+// ---------------------------------------------------------------------------
+void Code::setSearch(const char* aPattern, FindFlags aFlags) {
+    mp_impl->m_searchPattern = (aPattern != nullptr) ? aPattern : "";
+    mp_impl->m_searchFlags = aFlags;
+    mp_impl->computeMatches();
+}
+void Code::clearSearch() {
+    mp_impl->m_searchPattern.clear();
+    mp_impl->m_matches.clear();
+    mp_impl->m_currentMatch = -1;
+}
+int32_t Code::searchMatchCount() const {
+    return (int32_t)mp_impl->m_matches.size();
+}
+bool Code::findNext() { return mp_impl->findRelative(true); }
+bool Code::findPrev() { return mp_impl->findRelative(false); }
+bool Code::replaceCurrent(const char* aReplacement) {
+    if ((mp_impl->m_config.flags & Flags_ReadOnly) != 0) return false;
+    return mp_impl->replaceCurrentMatch(aReplacement != nullptr ? aReplacement : "");
+}
+int32_t Code::replaceAll(const char* aReplacement) {
+    if ((mp_impl->m_config.flags & Flags_ReadOnly) != 0) return 0;
+    return mp_impl->replaceAllMatches(aReplacement != nullptr ? aReplacement : "");
 }
 
 // ---------------------------------------------------------------------------

@@ -85,6 +85,13 @@ public:
     };
     typedef int Flags;
 
+    typedef int FindFlags;
+    enum FindFlags_ {
+        FindFlags_None            = 0,
+        FindFlags_CaseInsensitive = 1 << 0,
+        FindFlags_WholeWord       = 1 << 1,
+    };
+
     // ---- semantic commands (bound by the keymap, never hardcoded keys) ----
     enum class Command {
         // base
@@ -189,6 +196,15 @@ public:
 
     // ---- commands (the keymap calls these) ----
     bool execute(Command aCommand);
+
+    // ---- find / replace (literal v1; Matcher provider for regex later) ----
+    void    setSearch(const char* aPattern, FindFlags aFlags = FindFlags_None);  // recompute matches
+    void    clearSearch();
+    int32_t searchMatchCount() const;
+    bool    findNext();  // select next match after caret (wraps)
+    bool    findPrev();  // select previous match before caret (wraps)
+    bool    replaceCurrent(const char* aReplacement);  // replaces the current match
+    int32_t replaceAll(const char* aReplacement);      // returns the number replaced
 
     // ---- markers / decorations / diagnostics -> render layer ----
     void setMarkers(const std::vector<Marker>& aMarkers);
