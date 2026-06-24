@@ -488,13 +488,13 @@ struct Code::Impl {
 
     std::vector<std::string>           m_lines{std::string()};  // always at least one (empty) line
     std::string                        m_languageName;
-    size_t                             m_maxLineChars{};
+    size_t                             m_maxDisplayColumns{};    // widest line in tab-expanded display columns
     std::vector<std::vector<LexToken>> m_lineTokens;            // cached per-line coloring (parallel to m_lines)
 
     // caret / selection (single caret + range, no multi-cursor)
     Pos     m_cursor{};
     Pos     m_anchor{};          // selection anchor; selection is ordered(anchor, cursor)
-    int32_t m_desiredColumn{};   // sticky column for vertical moves
+    int32_t m_desiredColumn{};   // sticky DISPLAY column (tab-expanded) for vertical moves
     bool    m_ensureCursorVisible{};
     float   m_zoom{1.0f};        // local editor zoom (ctrl + mouse wheel), decoupled from global font
 
@@ -578,12 +578,42 @@ struct Code::Impl {
         else { aoStart = m_anchor; aoEnd = m_cursor; }
     }
 
-    void recomputeMaxLineChars() {
-        size_t maxc = 0;
-        for (const auto& line : m_lines) {
-            if (line.size() > maxc) maxc = line.size();
+    // Map a byte column to its display column, expanding tabs to the next tab
+    // stop (tabWidth). Display columns drive every on-screen X (monospace).
+    int32_t displayColumn(int32_t aLine, int32_t aByteColumn) const {
+        if (aLine < 0 || aLine > lastLineIndex()) return aByteColumn;
+        const std::string& line = m_lines[(size_t)aLine];
+        const int32_t tabW = (m_style.tabWidth > 0) ? m_style.tabWidth : 4;
+        const int32_t end = (aByteColumn < (int32_t)line.size()) ? aByteColumn : (int32_t)line.size();
+        int32_t disp = 0;
+        for (int32_t k = 0; k < end; ++k) {
+            if (line[(size_t)k] == '\t') disp += tabW - (disp % tabW);
+            else ++disp;
         }
-        m_maxLineChars = maxc;
+        if (aByteColumn > end) disp += aByteColumn - end;  // bytes past EOL count as 1 each
+        return disp;
+    }
+    // Inverse of displayColumn: nearest byte column for a display-column target
+    // (mouse hit-testing; a click past a glyph midpoint snaps to the next one).
+    int32_t byteColumnFromDisplay(int32_t aLine, float aDisplayCols) const {
+        if (aLine < 0 || aLine > lastLineIndex()) return 0;
+        const std::string& line = m_lines[(size_t)aLine];
+        const int32_t tabW = (m_style.tabWidth > 0) ? m_style.tabWidth : 4;
+        int32_t disp = 0;
+        for (int32_t k = 0; k < (int32_t)line.size(); ++k) {
+            const int32_t adv = (line[(size_t)k] == '\t') ? (tabW - (disp % tabW)) : 1;
+            if (aDisplayCols < (float)disp + (float)adv * 0.5f) return k;
+            disp += adv;
+        }
+        return (int32_t)line.size();
+    }
+    void recomputeMaxDisplayColumns() {
+        size_t maxc = 0;
+        for (int32_t i = 0; i <= lastLineIndex(); ++i) {
+            const size_t disp = (size_t)displayColumn(i, lineLen(i));
+            if (disp > maxc) maxc = disp;
+        }
+        m_maxDisplayColumns = maxc;
     }
     void relex() {
         m_lineTokens.assign(m_lines.size(), std::vector<LexToken>());
@@ -599,8 +629,8 @@ struct Code::Impl {
     void afterContentChanged() {
         m_cursor = clampPos(m_cursor);
         m_anchor = clampPos(m_anchor);
-        m_desiredColumn = m_cursor.column;
-        recomputeMaxLineChars();
+        setDesiredColumnFromCursor();
+        recomputeMaxDisplayColumns();
         relex();
         if (!m_searchPattern.empty()) computeMatches();
         m_ensureCursorVisible = true;
@@ -613,24 +643,29 @@ struct Code::Impl {
         m_ensureCursorVisible = true;
         m_lastEditKind = EditKind::Other;  // a caret move breaks the typing/deleting coalesce group
     }
+    // Desired column is a DISPLAY column (tab-expanded), so vertical moves keep
+    // the caret visually aligned across lines with different tab/space layouts.
+    void setDesiredColumnFromCursor() { m_desiredColumn = displayColumn(m_cursor.line, m_cursor.column); }
     void moveLeft(bool aShift) {
         Pos cur = m_cursor;
         if (cur.column > 0) cur.column--;
         else if (cur.line > 0) { cur.line--; cur.column = lineLen(cur.line); }
         place(cur, aShift);
-        m_desiredColumn = m_cursor.column;
+        setDesiredColumnFromCursor();
     }
     void moveRight(bool aShift) {
         Pos cur = m_cursor;
         if (cur.column < lineLen(cur.line)) cur.column++;
         else if (cur.line < lastLineIndex()) { cur.line++; cur.column = 0; }
         place(cur, aShift);
-        m_desiredColumn = m_cursor.column;
+        setDesiredColumnFromCursor();
     }
     void moveVertical(int32_t aDelta, bool aShift) {
         Pos cur = m_cursor;
         cur.line += aDelta;
-        cur.column = m_desiredColumn;
+        if (cur.line < 0) cur.line = 0;
+        if (cur.line > lastLineIndex()) cur.line = lastLineIndex();
+        cur.column = byteColumnFromDisplay(cur.line, (float)m_desiredColumn);  // land on the same visual column
         place(cur, aShift);
     }
     void moveHome(bool aShift) {
@@ -640,16 +675,16 @@ struct Code::Impl {
         Pos cur = m_cursor;
         cur.column = (cur.column == firstNonWs) ? 0 : firstNonWs;
         place(cur, aShift);
-        m_desiredColumn = m_cursor.column;
+        setDesiredColumnFromCursor();
     }
     void moveEnd(bool aShift) {
         Pos cur = m_cursor;
         cur.column = lineLen(cur.line);
         place(cur, aShift);
-        m_desiredColumn = m_cursor.column;
+        setDesiredColumnFromCursor();
     }
-    void moveDocStart(bool aShift) { place(Pos{0, 0}, aShift); m_desiredColumn = 0; }
-    void moveDocEnd(bool aShift) { place(Pos{lastLineIndex(), lineLen(lastLineIndex())}, aShift); m_desiredColumn = m_cursor.column; }
+    void moveDocStart(bool aShift) { place(Pos{0, 0}, aShift); setDesiredColumnFromCursor(); }
+    void moveDocEnd(bool aShift) { place(Pos{lastLineIndex(), lineLen(lastLineIndex())}, aShift); setDesiredColumnFromCursor(); }
     void selectAll() {
         m_anchor = Pos{0, 0};
         place(Pos{lastLineIndex(), lineLen(lastLineIndex())}, true);
@@ -874,7 +909,7 @@ struct Code::Impl {
         const Range r = m_matches[(size_t)aIndex];
         m_anchor = clampPos(r.start);
         m_cursor = clampPos(r.end);
-        m_desiredColumn = m_cursor.column;
+        setDesiredColumnFromCursor();
         m_ensureCursorVisible = true;
         m_lastEditKind = EditKind::Other;
         return true;
@@ -940,7 +975,7 @@ bool Code::init(const Config& aConfig) {
 
 void Code::unit() {
     mp_impl->m_lines.assign(1, std::string());
-    mp_impl->m_maxLineChars = 0;
+    mp_impl->m_maxDisplayColumns = 0;
     mp_impl->m_cursor = {};
     mp_impl->m_anchor = {};
     mp_impl->m_desiredColumn = 0;
@@ -966,7 +1001,7 @@ void Code::setText(const char* aData, uint64_t aLen) {
     mp_impl->m_desiredColumn = 0;
     mp_impl->m_undoStack.clear();
     mp_impl->m_redoStack.clear();
-    mp_impl->recomputeMaxLineChars();
+    mp_impl->recomputeMaxDisplayColumns();
     mp_impl->relex();
 }
 
@@ -1100,7 +1135,7 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
     const float gutterW = (float)digits * charWidth + pad * 3.0f;
 
     const ImVec2 contentOrigin = ImGui::GetCursorScreenPos();
-    const float  contentW = gutterW + (float)(impl.m_maxLineChars + 1) * charWidth;
+    const float  contentW = gutterW + (float)(impl.m_maxDisplayColumns + 1) * charWidth;
     const float  contentH = (float)lineCount * lineH;
     ImGui::Dummy(ImVec2(contentW, contentH));
 
@@ -1118,7 +1153,9 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
     const float textOriginX = contentOrigin.x + gutterW;
     auto posFromMouse = [&](ImVec2 aMouse) -> Pos {
         int32_t line = (int32_t)((aMouse.y - contentOrigin.y) / lineH);
-        int32_t col  = (int32_t)((aMouse.x - textOriginX) / charWidth + 0.5f);
+        if (line < 0) line = 0;
+        if (line > impl.lastLineIndex()) line = impl.lastLineIndex();
+        const int32_t col = impl.byteColumnFromDisplay(line, (aMouse.x - textOriginX) / charWidth);
         return impl.clampPos(Pos{line, col});
     };
 
@@ -1134,14 +1171,14 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
         } else {
             const Pos p = posFromMouse(mouse);
             impl.place(p, ImGui::GetIO().KeyShift);
-            impl.m_desiredColumn = p.column;
+            impl.setDesiredColumnFromCursor();
         }
     }
     const bool focused = ImGui::IsWindowFocused();
     if (focused && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
         const Pos p = posFromMouse(ImGui::GetMousePos());
         impl.place(p, true);
-        impl.m_desiredColumn = p.column;
+        impl.setDesiredColumnFromCursor();
     }
 
     // ctrl + wheel = local editor zoom; plain wheel = manual scroll (NoScrollWithMouse owns it)
@@ -1268,8 +1305,8 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
             const int32_t c0 = (i == selStart.line) ? selStart.column : 0;
             const int32_t c1 = (i == selEnd.line) ? selEnd.column : impl.lineLen(i);
             const float y  = contentOrigin.y + (float)i * lineH;
-            const float x0 = textOriginX + (float)c0 * charWidth;
-            const float x1 = textOriginX + (float)c1 * charWidth;
+            const float x0 = textOriginX + (float)impl.displayColumn(i, c0) * charWidth;
+            const float x1 = textOriginX + (float)impl.displayColumn(i, c1) * charWidth;
             drawList->AddRectFilled(ImVec2(x0, y), ImVec2(x1 + 1.0f, y + lineH), colSel);
         }
     }
@@ -1281,27 +1318,46 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
             const Range& r = impl.m_matches[m];
             if (r.start.line < firstLine || r.start.line >= lastLine) continue;
             const float y  = contentOrigin.y + (float)r.start.line * lineH;
-            const float x0 = textOriginX + (float)r.start.column * charWidth;
-            const float x1 = textOriginX + (float)r.end.column * charWidth;
+            const float x0 = textOriginX + (float)impl.displayColumn(r.start.line, r.start.column) * charWidth;
+            const float x1 = textOriginX + (float)impl.displayColumn(r.end.line, r.end.column) * charWidth;
             drawList->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + lineH), colMatch);
         }
     }
 
-    // text (colored token runs; fallback to plain default color)
+    // text — paint colored token runs, filling any gap the lexer left between
+    // them (e.g. unclassified bytes like '@', which produce no token) with the
+    // default color. Guarantees every visible byte is drawn, with zero overdraw.
     for (int32_t i = firstLine; i < lastLine; ++i) {
         const std::string& line = impl.m_lines[(size_t)i];
         if (line.empty()) continue;
         const float y = contentOrigin.y + (float)i * lineH + glyphY;
+        const int32_t lineSize = (int32_t)line.size();
+        const int32_t tabW = (impl.m_style.tabWidth > 0) ? impl.m_style.tabWidth : 4;
         const std::vector<LexToken>* toks = (i < (int32_t)impl.m_lineTokens.size()) ? &impl.m_lineTokens[(size_t)i] : nullptr;
-        if (toks == nullptr || toks->empty()) {
-            drawList->AddText(font, fontSize, ImVec2(textOriginX, y), colText, line.c_str(), line.c_str() + line.size());
-        } else {
+        int32_t disp = 0;  // running display column, advanced left to right across the whole line
+        auto drawRun = [&](int32_t aStart, int32_t aEnd, ImU32 aColor) {
+            int32_t k = aStart;
+            while (k < aEnd) {
+                if (line[(size_t)k] == '\t') {  // tab: invisible, jump to the next tab stop
+                    disp += tabW - (disp % tabW);
+                    ++k;
+                } else {  // batch a maximal non-tab span into a single AddText
+                    const int32_t spanStart = k;
+                    const float tx = textOriginX + (float)disp * charWidth;
+                    while (k < aEnd && line[(size_t)k] != '\t') { ++disp; ++k; }
+                    drawList->AddText(font, fontSize, ImVec2(tx, y), aColor, line.c_str() + spanStart, line.c_str() + k);
+                }
+            }
+        };
+        int32_t col = 0;  // first byte not yet drawn (runs stay contiguous so disp flows correctly)
+        if (toks != nullptr) {
             for (const LexToken& tok : *toks) {
-                const char* s  = line.c_str() + tok.start;
-                const float tx = textOriginX + (float)tok.start * charWidth;
-                drawList->AddText(font, fontSize, ImVec2(tx, y), style.colors[tok.color], s, s + tok.length);
+                if (tok.start > col) drawRun(col, tok.start, colText);  // gap -> default color
+                drawRun(tok.start, tok.start + tok.length, style.colors[tok.color]);
+                col = tok.start + tok.length;
             }
         }
+        if (col < lineSize) drawRun(col, lineSize, colText);  // trailing gap, or whole line if no tokens
     }
 
     // decorations + diagnostics (single-line in v1) — underline / squiggle / box + hover message
@@ -1323,8 +1379,8 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
         const int32_t ln = dec.range.start.line;
         if (ln != dec.range.end.line || ln < firstLine || ln >= lastLine) continue;
         const float y    = contentOrigin.y + (float)ln * lineH;
-        const float x0   = textOriginX + (float)dec.range.start.column * charWidth;
-        const float x1   = textOriginX + (float)dec.range.end.column * charWidth;
+        const float x0   = textOriginX + (float)impl.displayColumn(ln, dec.range.start.column) * charWidth;
+        const float x1   = textOriginX + (float)impl.displayColumn(ln, dec.range.end.column) * charWidth;
         const float base = y + glyphY + fontHeight;
         if (dec.kind == DecoKind::Box) {
             drawList->AddRect(ImVec2(x0, y + glyphY), ImVec2(x1, y + glyphY + fontHeight), dec.color, 0.0f, 0, decoThickness);
@@ -1344,8 +1400,8 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
         if (ln != diag.range.end.line || ln < firstLine || ln >= lastLine) continue;
         const ImU32 col  = (diag.severity == Severity::Error) ? style.colors[Col_MarkerError] : style.colors[Col_MarkerWarning];
         const float y    = contentOrigin.y + (float)ln * lineH;
-        const float x0   = textOriginX + (float)diag.range.start.column * charWidth;
-        const float x1   = textOriginX + (float)diag.range.end.column * charWidth;
+        const float x0   = textOriginX + (float)impl.displayColumn(ln, diag.range.start.column) * charWidth;
+        const float x1   = textOriginX + (float)impl.displayColumn(ln, diag.range.end.column) * charWidth;
         drawSquiggle(x0, x1, y + glyphY + fontHeight - 2.0f, col);
         if (!diag.message.empty() && ImGui::IsMouseHoveringRect(ImVec2(x0, y), ImVec2(x1, y + lineH))) {
             ImGui::SetTooltip("%s", diag.message.c_str());
@@ -1382,7 +1438,7 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
         const double timeNow = ImGui::GetTime();
         const bool blinkOn = (timeNow - (double)(int64_t)timeNow) < 0.5;
         if (blinkOn) {
-            const float cx = textOriginX + (float)impl.m_cursor.column * charWidth;
+            const float cx = textOriginX + (float)impl.displayColumn(impl.m_cursor.line, impl.m_cursor.column) * charWidth;
             const float cy = contentOrigin.y + (float)impl.m_cursor.line * lineH + glyphY;
             drawList->AddLine(ImVec2(cx, cy), ImVec2(cx, cy + fontHeight), colCaret, 1.0f);
         }
@@ -1401,7 +1457,7 @@ bool Code::Render(const char* aId, const ImVec2& aSize) {
 Code::Pos Code::getCursor() const { return mp_impl->m_cursor; }
 void Code::setCursor(const Pos& aPos) {
     mp_impl->place(aPos, false);
-    mp_impl->m_desiredColumn = mp_impl->m_cursor.column;
+    mp_impl->setDesiredColumnFromCursor();
 }
 Code::Range Code::getSelection() const {
     Range range;
